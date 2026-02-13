@@ -79,6 +79,7 @@ class UserTranscriptProcessor(BaseTranscriptProcessor):
             logger.debug(f"{self} {frame}")
 
         if isinstance(frame, TranscriptionFrame):
+            logger.debug(f"User transcription: [{frame.text}]")
             message = TranscriptionMessage(
                 role="user", user_id=frame.user_id, content=frame.text, timestamp=frame.timestamp
             )
@@ -160,7 +161,7 @@ class AssistantTranscriptProcessor(BaseTranscriptProcessor):
                     logger.error(f"Error in transcript correction callback: {e}")
 
             if content:
-                logger.trace(f"Emitting aggregated assistant message: {content}")
+                logger.debug(f"Assistant transcription: [{content}]")
                 message = TranscriptionMessage(
                     role="assistant",
                     content=content,
