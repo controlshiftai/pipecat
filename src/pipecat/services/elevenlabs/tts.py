@@ -121,7 +121,9 @@ def output_format_from_sample_rate(sample_rate: int) -> str:
     """
     match sample_rate:
         case 8000:
-            return "pcm_8000"
+            # ElevenLabs does not support 8kHz PCM, so we use 16kHz and let
+            # the transport resample it for us.
+            return "pcm_16000"
         case 16000:
             return "pcm_16000"
         case 22050:
@@ -436,6 +438,10 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         """
         await super().start(frame)
         self._output_format = output_format_from_sample_rate(self.sample_rate)
+        # If we were forced to 16kHz because of 8kHz request, update our sample_rate
+        # so frames are labeled correctly and the transport resamples them.
+        if self._output_format == "pcm_16000" and self.sample_rate == 8000:
+            self._sample_rate = 16000
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -885,6 +891,10 @@ class ElevenLabsHttpTTSService(WordTTSService):
         """
         await super().start(frame)
         self._output_format = output_format_from_sample_rate(self.sample_rate)
+        # If we were forced to 16kHz because of 8kHz request, update our sample_rate
+        # so frames are labeled correctly and the transport resamples them.
+        if self._output_format == "pcm_16000" and self.sample_rate == 8000:
+            self._sample_rate = 16000
         self._reset_state()
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
