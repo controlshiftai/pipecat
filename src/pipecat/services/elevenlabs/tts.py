@@ -480,7 +480,9 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         await super().push_frame(frame, direction)
         if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
             self._started = False
+            # Clear context ID on any stop so the next sequence is fresh.
             if isinstance(frame, TTSStoppedFrame):
+                self._context_id = None
                 await self.add_word_timestamps([("Reset", 0)])
 
     async def _connect(self):
@@ -605,6 +607,11 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             # sent, so it doesn't serve any functional purpose. For now, we'll just log it.
             if msg.get("isFinal") is True:
                 logger.trace(f"Received final message for context {received_ctx_id}")
+                if received_ctx_id and self.audio_context_available(received_ctx_id):
+                    await self.remove_audio_context(received_ctx_id)
+                # If this was our current active context, clear it to avoid reuse
+                if self._context_id == received_ctx_id:
+                    self._context_id = None
                 continue
 
             # Check if this message belongs to the current context.
@@ -709,7 +716,9 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             try:
                 if not self._started:
                     await self.start_ttfb_metrics()
-                    yield TTSStartedFrame()
+                    # Always use a fresh context ID for a new utterance sequence
+                    self._context_id = str(uuid.uuid4())
+                    yield TTSStartedFrame(context_id=self._context_id)
                     self._started = True
                     self._cumulative_time = 0
                     self._partial_word = ""
@@ -720,8 +729,6 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
                     # using the current ID. When interruptions are enabled
                     # (e.g. allow_interruptions=True), user speech results in
                     # an interruption, which resets the context ID.
-                    if not self._context_id:
-                        self._context_id = str(uuid.uuid4())
                     if not self.audio_context_available(self._context_id):
                         await self.create_audio_context(self._context_id)
 
