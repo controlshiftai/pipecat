@@ -76,12 +76,18 @@ class SarvamSTTService(STTService):
                    Only applicable to saaras (STT-Translate) models. Defaults to None.
             vad_signals: Enable VAD signals in response. Defaults to True.
             high_vad_sensitivity: Enable high VAD (Voice Activity Detection) sensitivity. Defaults to False.
+            mode: Output mode for saaras (STT-Translate) models. One of:
+                  "transcribe" (preserves source language — recommended for voice agents),
+                  "translate" (translates to English — original SDK default),
+                  "verbatim", "transliterate", "codemix".
+                  Ignored for saarika models. When None and model is saaras, defaults to "transcribe".
         """
 
         language: Optional[Language] = None
         prompt: Optional[str] = None
         vad_signals: bool = True
         high_vad_sensitivity: bool = False
+        mode: Optional[str] = None
 
     def __init__(
         self,
@@ -134,6 +140,14 @@ class SarvamSTTService(STTService):
         else:
             self._language_string = None
         self._prompt = params.prompt
+        # For saaras (STT-Translate) models, default mode to "transcribe" — preserves
+        # source language, which is what voice agents want. Without this, Saaras defaults
+        # to "translate" (English output), which is wrong for native-language voice agents.
+        # Saarika models ignore mode entirely.
+        if "saaras" in model.lower() and params.mode is None:
+            self._mode = "transcribe"
+        else:
+            self._mode = params.mode
 
         # Store connection parameters
         self._vad_signals = params.vad_signals
@@ -305,7 +319,11 @@ class SarvamSTTService(STTService):
                     **connect_kwargs
                 )
             else:
-                # STT-Translate service - auto-detects input language and returns translated text
+                # STT-Translate service - auto-detects input language. Mode controls output:
+                # "transcribe" preserves source language (voice agent default).
+                # "translate" returns English (legacy SDK default — wrong for voice agents).
+                if self._mode:
+                    connect_kwargs["mode"] = self._mode
                 self._websocket_context = (
                     self._sarvam_client.speech_to_text_translate_streaming.connect(**connect_kwargs)
                 )
