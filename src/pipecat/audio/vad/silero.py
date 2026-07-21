@@ -31,6 +31,16 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module(s): {e}")
 
 
+# Process-wide cache of loaded Silero ONNX InferenceSessions, keyed by
+# (model_path, force_cpu). The model weights are identical across every call, so
+# reloading the ONNX file from disk on each call wasted ~50-150ms on the answer
+# critical path. onnxruntime InferenceSession.run() is thread-safe, and the
+# recurrent VAD state (SileroOnnxModel._state/_context) lives on the wrapper
+# instance — NOT on the session — so a single session shared across concurrent
+# calls is safe (each call keeps its own state and passes it into run()).
+_SILERO_SESSION_CACHE: dict = {}
+
+
 class SileroOnnxModel:
     """ONNX runtime wrapper for the Silero VAD model.
 
@@ -46,16 +56,25 @@ class SileroOnnxModel:
             path: Path to the ONNX model file.
             force_onnx_cpu: Whether to force CPU execution provider.
         """
-        opts = onnxruntime.SessionOptions()
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
+        # Reuse a process-wide session (see _SILERO_SESSION_CACHE note above)
+        # instead of reloading the ONNX model every call. On a cache miss we
+        # load exactly as before.
+        cache_key = (path, bool(force_onnx_cpu))
+        session = _SILERO_SESSION_CACHE.get(cache_key)
+        if session is None:
+            opts = onnxruntime.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
 
-        if force_onnx_cpu and "CPUExecutionProvider" in onnxruntime.get_available_providers():
-            self.session = onnxruntime.InferenceSession(
-                path, providers=["CPUExecutionProvider"], sess_options=opts
-            )
-        else:
-            self.session = onnxruntime.InferenceSession(path, sess_options=opts)
+            if force_onnx_cpu and "CPUExecutionProvider" in onnxruntime.get_available_providers():
+                session = onnxruntime.InferenceSession(
+                    path, providers=["CPUExecutionProvider"], sess_options=opts
+                )
+            else:
+                session = onnxruntime.InferenceSession(path, sess_options=opts)
+            _SILERO_SESSION_CACHE[cache_key] = session
+
+        self.session = session
 
         self.reset_states()
         self.sample_rates = [8000, 16000]
