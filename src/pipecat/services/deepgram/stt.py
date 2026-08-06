@@ -119,6 +119,8 @@ class DeepgramSTTService(STTService):
         self.set_model_name(merged_options["model"])
         self._settings = merged_options
         self._addons = addons
+        self._finalize_event = asyncio.Event()
+        self._finalize_requested = False
 
         self._client = DeepgramClient(
             api_key,
@@ -199,6 +201,32 @@ class DeepgramSTTService(STTService):
         """
         await super().cancel(frame)
         await self._disconnect()
+
+    async def finalize(self, timeout: float = 0.75) -> bool:
+        """Flush buffered streaming audio and await a final result.
+
+        Deepgram's streaming API does not guarantee a ``from_finalize``
+        response when no meaningful audio remains, so the wait is bounded and
+        also accepts the next final transcription received after the request.
+        This is intended for transport disconnects where cancelling the
+        pipeline immediately would otherwise drop the caller's last words.
+        """
+        if not self._connection or not await self._connection.is_connected():
+            return False
+
+        self._finalize_event.clear()
+        self._finalize_requested = True
+        try:
+            await self._connection.finalize()
+            await asyncio.wait_for(self._finalize_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"{self}: no explicit Deepgram finalize response within {timeout}s"
+            )
+            return False
+        finally:
+            self._finalize_requested = False
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """Send audio data to Deepgram for transcription.
@@ -286,6 +314,8 @@ class DeepgramSTTService(STTService):
 
     async def _on_message(self, *args, **kwargs):
         result: LiveResultResponse = kwargs["result"]
+        if self._finalize_requested and getattr(result, "from_finalize", False):
+            self._finalize_event.set()
         if len(result.channel.alternatives) == 0:
             return
         is_final = result.is_final
@@ -319,6 +349,8 @@ class DeepgramSTTService(STTService):
                         result=result,
                     )
                 )
+        if self._finalize_requested and is_final:
+            self._finalize_event.set()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames with Deepgram-specific handling.
