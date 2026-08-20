@@ -12,6 +12,7 @@ where applicable and Pipecat-specific conventions for additional context.
 """
 
 import json
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 # Import for type checking only
@@ -22,6 +23,11 @@ from pipecat.utils.tracing.setup import is_tracing_available
 
 if is_tracing_available():
     from opentelemetry.trace import Span
+
+
+def _include_trace_content() -> bool:
+    """Raw voice/LLM content is opt-in; latency metadata is always traced."""
+    return os.environ.get("TRACE_INCLUDE_CONTENT", "false").lower() == "true"
 
 
 def _get_gen_ai_system_from_service_name(service_name: str) -> str:
@@ -97,7 +103,7 @@ def add_tts_span_attributes(
     span.set_attribute("voice_id", voice_id)
 
     # Add optional attributes
-    if text:
+    if text and _include_trace_content():
         span.set_attribute("input", text)
 
     if character_count is not None:
@@ -155,7 +161,7 @@ def add_stt_span_attributes(
     span.set_attribute("vad_enabled", vad_enabled)
 
     # Add optional attributes
-    if transcript:
+    if transcript and _include_trace_content():
         span.set_attribute("output", transcript)
 
     if is_final is not None:
@@ -222,16 +228,19 @@ def add_llm_span_attributes(
     span_input = {}
 
     # Add optional attributes
-    if messages:
+    if messages and _include_trace_content():
         span_input["messages"] = messages
 
-    if tools:
+    if tools and _include_trace_content():
         span_input["tools"] = tools
+    elif tools:
+        span.set_attribute("tools.count", len(tools))
 
     # Set input in ChatML format
-    span.set_attribute("input", json.dumps(span_input))
+    if span_input:
+        span.set_attribute("input", json.dumps(span_input))
 
-    if output:
+    if output and _include_trace_content():
         span.set_attribute("output", output)
 
     if tool_choice:
@@ -322,12 +331,12 @@ def add_gemini_live_span_attributes(
     if modalities:
         span.set_attribute("modalities", modalities)
 
-    if transcript:
+    if transcript and _include_trace_content():
         span.set_attribute("transcript", transcript)
         if is_input is not None:
             span.set_attribute("transcript.is_input", is_input)
 
-    if text_output:
+    if text_output and _include_trace_content():
         span.set_attribute("text_output", text_output)
 
     if audio_data_size is not None:
@@ -414,12 +423,12 @@ def add_openai_realtime_span_attributes(
     span.set_attribute("service.operation", operation_name)
 
     # Add optional attributes
-    if transcript:
+    if transcript and _include_trace_content():
         span.set_attribute("transcript", transcript)
         if is_input is not None:
             span.set_attribute("transcript.is_input", is_input)
 
-    if context_messages:
+    if context_messages and _include_trace_content():
         span.set_attribute("input", context_messages)
 
     if audio_data_size is not None:
