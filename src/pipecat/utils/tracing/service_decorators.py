@@ -30,6 +30,7 @@ from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.utils.tracing.context_registry import get_current_turn_context
 from pipecat.utils.tracing.service_attributes import (
+    _include_trace_content,
     add_gemini_live_span_attributes,
     add_llm_span_attributes,
     add_openai_realtime_span_attributes,
@@ -44,6 +45,19 @@ if is_tracing_available():
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+
+def _resolve_model_name(service) -> str:
+    """Return the provider-resolved model name, falling back to configuration.
+
+    OpenAI begins with an empty ``_full_model_name`` and fills it from the
+    first streamed chunk. The previous implementation accidentally used that
+    model string as an attribute name, so all LLM observations were exported
+    as ``unknown``.
+    """
+    full_model_name = getattr(service, "_full_model_name", None)
+    configured_model_name = getattr(service, "model_name", None)
+    return str(full_model_name or configured_model_name or "unknown")
 
 
 def _noop_decorator(func):
@@ -400,6 +414,11 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         # Accumulator for plain text tokens streamed by the LLM
                         output_text = ""  # Simple string accumulation
 
+                        # Raw prompts, responses and tool arguments can contain
+                        # caller PII. Capture them only under the explicit
+                        # TRACE_INCLUDE_CONTENT opt-in.
+                        include_trace_content = _include_trace_content()
+
                         # Accumulator for function call information emitted during the
                         # generation (captured from FunctionCallsStartedFrame frames)
                         function_calls_info = []
@@ -410,7 +429,8 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             # Capture text tokens streamed by the LLM
                             # ------------------------------------------------------------------
                             if (
-                                hasattr(frame, "__class__")
+                                include_trace_content
+                                and hasattr(frame, "__class__")
                                 and frame.__class__.__name__ == "LLMTextFrame"
                                 and hasattr(frame, "text")
                             ):
@@ -421,7 +441,8 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             # function name and its arguments in the tracing span.
                             # ------------------------------------------------------------------
                             if (
-                                hasattr(frame, "__class__")
+                                include_trace_content
+                                and hasattr(frame, "__class__")
                                 and frame.__class__.__name__ == "FunctionCallsFromLLMInfoFrame"
                                 and direction == FrameDirection.DOWNSTREAM
                             ):
@@ -535,9 +556,7 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             # Add all available attributes to the span
                             attribute_kwargs = {
                                 "service_name": service_class_name,
-                                "model": getattr(
-                                    self, getattr(self, "_full_model_name", "model_name"), "unknown"
-                                ),
+                                "model": _resolve_model_name(self),
                                 "stream": True,  # Most LLM services use streaming
                                 "parameters": params,
                             }
@@ -560,15 +579,16 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         # Append JSON dump of function calls to the output text so that
                         # the consumer can see both in a single attribute.
                         # --------------------------------------------------------------
-                        span_output = {"content": output_text}
+                        if include_trace_content:
+                            span_output = {"content": output_text}
 
-                        if function_calls_info:
-                            span_output["tool_calls"] = function_calls_info
+                            if function_calls_info:
+                                span_output["tool_calls"] = function_calls_info
 
-                        try:
-                            current_span.set_attribute("output", json.dumps(span_output))
-                        except Exception:
-                            logger.error(f"Unable to serialize span output: {span_output}")
+                            try:
+                                current_span.set_attribute("output", json.dumps(span_output))
+                            except Exception:
+                                logger.error(f"Unable to serialize span output: {span_output}")
 
                         return result
 

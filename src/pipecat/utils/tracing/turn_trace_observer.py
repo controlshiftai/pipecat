@@ -145,11 +145,13 @@ class TurnTraceObserver(BaseObserver):
             # Record the timestamp – actual span already exists from turn start
             # logger.debug("VADUserStoppedSpeakingFrame in TurnTraceObserver")
             self._vad_stopped_ts = time.time()
+            self._start_latency_span("vad_stop")
 
         elif isinstance(frame, UserStoppedSpeakingFrame):
             # Record generic user stop speaking timestamp (may occur before definitive VAD stop)
             # logger.debug("UserStoppedSpeakingFrame in TurnTraceObserver")
             self._user_stopped_ts = time.time()
+            self._start_latency_span("user_stop")
 
         elif isinstance(frame, BotStartedSpeakingFrame):
             # Capture latency attribute once
@@ -170,6 +172,12 @@ class TurnTraceObserver(BaseObserver):
                     self._latency_span.set_attribute(
                         "user_stop_to_bot_start_latency", latency_user * 1000
                     )
+
+                # This observation represents response-start latency, not the
+                # full turn. Ending it here makes Langfuse's displayed span
+                # duration match the caller-visible pause.
+                self._latency_span.end()
+                self._latency_span = None
 
         # ------------------------------------------------------------
         # 2) MetricsFrames – capture TTFB and end-of-turn processing times
@@ -296,10 +304,10 @@ class TurnTraceObserver(BaseObserver):
         # Update the context provider so services can access this span
         self._turn_provider.set_current_turn_context(self._current_span.get_span_context())
 
-        # Pre-create latency span for this turn so we can accrue attributes over time
-        self._latency_span = self._tracer.start_span(
-            "latency.user_stop_to_bot_start", context=self._turn_provider.get_current_turn_context()
-        )
+        # The latency span starts only when user/VAD speech-stop is observed.
+        # Initial greetings therefore do not create misleading 8–13 second
+        # response-latency observations spanning the entire turn.
+        self._latency_span = None
         self._user_stopped_ts = 0.0
         self._vad_stopped_ts = 0.0
 
@@ -331,6 +339,17 @@ class TurnTraceObserver(BaseObserver):
             self._turn_provider.set_current_turn_context(None)
 
             logger.debug(f"Ended tracing for Turn {turn_number}")
+
+    def _start_latency_span(self, source: str) -> None:
+        """Start one response-latency observation for the active turn."""
+        if self._latency_span is not None or not self._tracer:
+            return
+
+        self._latency_span = self._tracer.start_span(
+            "latency.user_stop_to_bot_start",
+            context=self._turn_provider.get_current_turn_context(),
+        )
+        self._latency_span.set_attribute("latency.start_source", source)
 
     def get_current_turn_context(self) -> Optional["SpanContext"]:
         """Get the span context for the current turn.
