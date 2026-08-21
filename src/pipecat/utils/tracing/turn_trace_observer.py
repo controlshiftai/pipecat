@@ -21,6 +21,8 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     MetricsFrame,
     STTMuteFrame,
+    TranscriptionFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -101,6 +103,10 @@ class TurnTraceObserver(BaseObserver):
         self._user_stopped_ts: float = 0.0
         # Timestamp when VAD non-definitively detected the user stopped speaking (pre end of turn)
         self._vad_stopped_ts: float = 0.0
+        # Most recent final STT result. Comparing it with the response gate
+        # shows how long a ready transcript waited for endpointing/VAD.
+        self._stt_final_ts: float = 0.0
+        self._latency_started_ts: float = 0.0
 
         # STT mute tracking
         self._stt_muted: bool = False
@@ -141,17 +147,44 @@ class TurnTraceObserver(BaseObserver):
         # ------------------------------------------------------------
         # 1) Latency attributes within the pre-allocated span
         # ------------------------------------------------------------
-        if isinstance(frame, VADUserStoppedSpeakingFrame):
+        if isinstance(frame, TranscriptionFrame):
+            self._stt_final_ts = time.time()
+
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # If the caller has to speak again before the agent produces audio,
+            # close the previous attempt honestly instead of spanning multiple
+            # utterances (the Gemini post-tool empty-response failure).
+            if self._latency_span is not None:
+                now = time.time()
+                self._latency_span.set_attribute("latency.outcome", "user_reprompted_before_bot")
+                if self._latency_started_ts > 0:
+                    self._latency_span.set_attribute(
+                        "user_reprompted_before_bot_latency",
+                        max(now - self._latency_started_ts, 0.0) * 1000,
+                    )
+                self._latency_span.end()
+                self._latency_span = None
+                self._user_stopped_ts = 0.0
+                self._vad_stopped_ts = 0.0
+                self._stt_final_ts = 0.0
+                self._latency_started_ts = 0.0
+
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Record the timestamp – actual span already exists from turn start
             # logger.debug("VADUserStoppedSpeakingFrame in TurnTraceObserver")
             self._vad_stopped_ts = time.time()
-            self._start_latency_span("vad_stop")
+            self._start_latency_span("vad_stop", self._vad_stopped_ts)
 
         elif isinstance(frame, UserStoppedSpeakingFrame):
             # Record generic user stop speaking timestamp (may occur before definitive VAD stop)
             # logger.debug("UserStoppedSpeakingFrame in TurnTraceObserver")
             self._user_stopped_ts = time.time()
-            self._start_latency_span("user_stop")
+            self._start_latency_span("user_stop", self._user_stopped_ts)
+            if self._latency_span is not None and self._stt_final_ts > 0:
+                self._latency_span.set_attribute(
+                    "stt_final_to_response_gate_latency",
+                    max(self._user_stopped_ts - self._stt_final_ts, 0.0) * 1000,
+                )
 
         elif isinstance(frame, BotStartedSpeakingFrame):
             # Capture latency attribute once
@@ -172,12 +205,19 @@ class TurnTraceObserver(BaseObserver):
                     self._latency_span.set_attribute(
                         "user_stop_to_bot_start_latency", latency_user * 1000
                     )
+                if self._stt_final_ts > 0:
+                    self._latency_span.set_attribute(
+                        "stt_final_to_bot_start_latency",
+                        max(now - self._stt_final_ts, 0.0) * 1000,
+                    )
+                self._latency_span.set_attribute("latency.outcome", "bot_started")
 
                 # This observation represents response-start latency, not the
                 # full turn. Ending it here makes Langfuse's displayed span
                 # duration match the caller-visible pause.
                 self._latency_span.end()
                 self._latency_span = None
+                self._latency_started_ts = 0.0
 
         # ------------------------------------------------------------
         # 2) MetricsFrames – capture TTFB and end-of-turn processing times
@@ -310,6 +350,8 @@ class TurnTraceObserver(BaseObserver):
         self._latency_span = None
         self._user_stopped_ts = 0.0
         self._vad_stopped_ts = 0.0
+        self._stt_final_ts = 0.0
+        self._latency_started_ts = 0.0
 
         logger.debug(f"Started tracing for Turn {turn_number}")
 
@@ -326,10 +368,13 @@ class TurnTraceObserver(BaseObserver):
 
             # End latency span if it hasn't been closed yet (e.g., bot never spoke)
             if self._latency_span is not None:
+                self._latency_span.set_attribute("latency.outcome", "turn_ended_without_bot")
                 self._latency_span.end()
                 self._latency_span = None
                 self._user_stopped_ts = 0.0
                 self._vad_stopped_ts = 0.0
+                self._stt_final_ts = 0.0
+                self._latency_started_ts = 0.0
 
             # Now end the main turn span
             self._current_span.end()
@@ -340,7 +385,7 @@ class TurnTraceObserver(BaseObserver):
 
             logger.debug(f"Ended tracing for Turn {turn_number}")
 
-    def _start_latency_span(self, source: str) -> None:
+    def _start_latency_span(self, source: str, started_at: float) -> None:
         """Start one response-latency observation for the active turn."""
         if self._latency_span is not None or not self._tracer:
             return
@@ -350,6 +395,7 @@ class TurnTraceObserver(BaseObserver):
             context=self._turn_provider.get_current_turn_context(),
         )
         self._latency_span.set_attribute("latency.start_source", source)
+        self._latency_started_ts = started_at
 
     def get_current_turn_context(self) -> Optional["SpanContext"]:
         """Get the span context for the current turn.
