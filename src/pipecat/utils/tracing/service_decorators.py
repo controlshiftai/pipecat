@@ -28,7 +28,10 @@ if TYPE_CHECKING:
 
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.utils.tracing.context_registry import get_current_turn_context
+from pipecat.utils.tracing.context_registry import (
+    get_current_conversation_context,
+    get_current_turn_context,
+)
 from pipecat.utils.tracing.service_attributes import (
     _include_trace_content,
     add_gemini_live_span_attributes,
@@ -92,6 +95,21 @@ def _get_parent_service_context(self):
 
     # If we can't find a stored span, default to current context
     return context_api.get_current()
+
+
+def _get_parent_context(self):
+    """Return the closest active call context for a service observation.
+
+    A service normally runs inside a conversational turn. Post-call extraction
+    and final queued audio can run after that turn has closed but before the
+    conversation itself is cleaned up. Falling back to the conversation keeps
+    those observations on the same call trace instead of creating orphan roots.
+    """
+    return (
+        get_current_turn_context()
+        or get_current_conversation_context()
+        or _get_parent_service_context(self)
+    )
 
 
 def _add_token_usage_to_span(span, token_usage):
@@ -193,8 +211,7 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
             span_name = "tts"
 
             # Get parent context
-            turn_context = get_current_turn_context()
-            parent_context = turn_context or _get_parent_service_context(self)
+            parent_context = _get_parent_context(self)
 
             # Create span
             tracer = trace.get_tracer("pipecat")
@@ -300,8 +317,7 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                 span_name = "stt"
 
                 # Get the turn context first, then fall back to service context
-                turn_context = get_current_turn_context()
-                parent_context = turn_context or _get_parent_service_context(self)
+                parent_context = _get_parent_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -400,8 +416,7 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         span_name += f"-{node_slug}"
 
                 # Get the parent context - turn context if available, otherwise service context
-                turn_context = get_current_turn_context()
-                parent_context = turn_context or _get_parent_service_context(self)
+                parent_context = _get_parent_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -651,8 +666,7 @@ def traced_gemini_live(operation: str) -> Callable:
                 span_name = f"{operation}"
 
                 # Get the parent context - turn context if available, otherwise service context
-                turn_context = get_current_turn_context()
-                parent_context = turn_context or _get_parent_service_context(self)
+                parent_context = _get_parent_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -956,8 +970,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                 span_name = f"{operation}"
 
                 # Get the parent context - turn context if available, otherwise service context
-                turn_context = get_current_turn_context()
-                parent_context = turn_context or _get_parent_service_context(self)
+                parent_context = _get_parent_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
