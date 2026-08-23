@@ -684,8 +684,12 @@ class GoogleLLMService(LLMService):
         Gemini 2.5 and 3 series models have this thinking process.
 
         Parameters:
-            thinking_level: Thinking level for Gemini 3 Pro. Can be "low" or "high".
-                If not provided, Gemini 3 Pro defaults to "high".
+            thinking_level: Thinking level, for Gemini 3 models.
+                Gemini 3 Flash models accept "minimal", "low", "medium" and "high"
+                (Gemini 3.7 Flash drops "minimal"); Gemini 3 Pro accepts "low" and
+                "high". If not provided, Pipecat applies the lowest level each
+                Flash/Lite model accepts (see _LOWEST_MODEL_THINKING_LEVELS) to
+                reduce latency; Pro models keep the API default ("high").
                 Note: Gemini 2.5 series should use thinking_budget instead.
             thinking_budget: Token budget for thinking, for Gemini 2.5 series.
                 -1 for dynamic thinking (model decides), 0 to disable thinking,
@@ -957,7 +961,6 @@ class GoogleLLMService(LLMService):
         reasoning_tokens = 0
 
         grounding_metadata = None
-        search_result = ""
         text_generated_signal = False
 
         # Reset pending function calls when processing a new context
@@ -1006,7 +1009,6 @@ class GoogleLLMService(LLMService):
                                     await self.push_frame(LLMThoughtEndFrame())
                                 else:
                                     text_generated_signal = True
-                                    search_result += part.text
                                     accumulated_text += part.text
                                     await self.push_frame(LLMTextFrame(part.text))
                             elif part.function_call:
