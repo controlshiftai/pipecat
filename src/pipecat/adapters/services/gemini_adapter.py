@@ -575,6 +575,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         # Thought signatures are already in message order.
         thought_signatures_applied = 0
         message_start_index = 0  # Track where to start searching for the next matching message.
+        matched_indices = set()  # Messages that already received a signature.
         for thought_signature_dict in thought_signature_dicts:
             signature = thought_signature_dict.get("signature")
             bookmark = thought_signature_dict.get("bookmark")
@@ -582,6 +583,7 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                 continue
 
             # Search through remaining assistant messages for a match
+            matched = False
             for i in range(message_start_index, len(assistant_messages)):
                 message = assistant_messages[i]
                 if not message.parts:
@@ -595,9 +597,38 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
                     # Apply the thought signature
                     last_part.thought_signature = signature
                     thought_signatures_applied += 1
+                    matched_indices.add(i)
+                    matched = True
 
                     # Update the start index and stop searching for a match
                     message_start_index = i + 1
+                    break
+
+            if matched:
+                continue
+
+            # Fallback: the fork defers function calls until after TTS, so a
+            # response shaped [function_call, text] lands in context as
+            # [text message, tool_calls message] while its signatures arrive as
+            # [fc signature, text signature]. Once the fc signature matches the
+            # later tool_calls message, the monotonic scan above can never reach
+            # the earlier text message. Retry over earlier, still-unsigned
+            # messages rather than silently dropping the signature.
+            for i in range(0, message_start_index):
+                if i in matched_indices:
+                    continue
+                message = assistant_messages[i]
+                if not message.parts:
+                    continue
+                last_part = message.parts[-1]
+                if self._thought_signature_bookmark_matches_part(bookmark, last_part):
+                    last_part.thought_signature = signature
+                    thought_signatures_applied += 1
+                    matched_indices.add(i)
+                    logger.debug(
+                        "Applied thought signature to an earlier message "
+                        "(deferred function call reordering)"
+                    )
                     break
 
         # For debugging, print out how many thought signatures were applied
