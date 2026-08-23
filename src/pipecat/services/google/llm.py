@@ -669,6 +669,12 @@ class GoogleLLMService(LLMService):
     expected by the Google AI model.
     """
 
+    # The lowest thinking level each model accepts, keyed by model name prefix. A
+    # model that isn't listed is assumed to accept "minimal", the fastest setting.
+    _LOWEST_MODEL_THINKING_LEVELS = {
+        "gemini-3.7-flash": "low",
+    }
+
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
 
@@ -806,7 +812,13 @@ class GoogleLLMService(LLMService):
             messages = context.messages
             system = getattr(context, "system_message", None)
 
-        generation_config = GenerateContentConfig(system_instruction=system)
+        generation_params: Dict[str, Any] = {"system_instruction": system}
+        if self._settings["thinking"]:
+            generation_params["thinking_config"] = self._settings["thinking"].model_dump(
+                exclude_unset=True
+            )
+        self._maybe_unset_thinking_budget(generation_params)
+        generation_config = GenerateContentConfig(**generation_params)
 
         # Use the new google-genai client's async method
         response = await self._client.aio.models.generate_content(
@@ -825,18 +837,27 @@ class GoogleLLMService(LLMService):
 
     def _maybe_unset_thinking_budget(self, generation_params: Dict[str, Any]):
         try:
-            # There's no way to introspect on model capabilities, so
-            # to check for models that we know default to thinkin on
-            # and can be configured to turn it off.
-            if not self._model_name.startswith("gemini-2.5-flash"):
+            model = self._model_name
+            # If we have an image model, we don't apply a thinking default.
+            if "image" in model:
                 return
-            # If we have an image model, we don't use a budget either.
-            if "image" in self._model_name:
-                return
-            # If thinking_config is already set, don't override it.
+            # If thinking_config is already set, explicit configuration wins.
             if "thinking_config" in generation_params:
                 return
-            generation_params.setdefault("thinking_config", {})["thinking_budget"] = 0
+            # Gemini 2.5 Flash: disable thinking via thinking_budget.
+            if model.startswith("gemini-2.5-flash"):
+                generation_params["thinking_config"] = {"thinking_budget": 0}
+            # Gemini 3 Flash/Lite: use the lowest thinking_level the model accepts.
+            elif model.startswith("gemini-3") and ("flash" in model or "lite" in model):
+                level = next(
+                    (
+                        lowest
+                        for prefix, lowest in self._LOWEST_MODEL_THINKING_LEVELS.items()
+                        if model.startswith(prefix)
+                    ),
+                    "minimal",
+                )
+                generation_params["thinking_config"] = {"thinking_level": level}
         except Exception as e:
             logger.error(f"Failed to unset thinking budget: {e}")
 
