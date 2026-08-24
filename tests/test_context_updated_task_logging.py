@@ -54,9 +54,12 @@ class TestContextUpdatedTaskLogging(unittest.TestCase):
         aggregator = LLMAssistantAggregator(LLMContext())
 
         async def make():
-            return asyncio.get_running_loop().create_task(asyncio.sleep(0))
+            task = asyncio.get_running_loop().create_task(asyncio.sleep(0))
+            await task  # ensure it completes successfully before the loop closes
+            return task
 
         task = asyncio.run(make())
+        assert task.done() and not task.cancelled() and task.exception() is None
         aggregator._context_updated_tasks.add(task)
 
         records = []
@@ -70,6 +73,35 @@ class TestContextUpdatedTaskLogging(unittest.TestCase):
         self.assertFalse(
             any("on_context_updated task failed" in record for record in records),
             f"unexpected failure log: {records}",
+        )
+
+    def test_cancelled_task_is_discarded_without_error_log(self):
+        aggregator = LLMAssistantAggregator(LLMContext())
+
+        async def make():
+            task = asyncio.get_running_loop().create_task(asyncio.sleep(10))
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return task
+
+        task = asyncio.run(make())
+        assert task.cancelled()
+        aggregator._context_updated_tasks.add(task)
+
+        records = []
+        sink_id = logger.add(lambda message: records.append(str(message)), level="ERROR")
+        try:
+            aggregator._context_updated_task_finished(task)
+        finally:
+            logger.remove(sink_id)
+
+        self.assertNotIn(task, aggregator._context_updated_tasks)
+        self.assertFalse(
+            any("on_context_updated task failed" in record for record in records),
+            f"unexpected failure log for cancelled task: {records}",
         )
 
 

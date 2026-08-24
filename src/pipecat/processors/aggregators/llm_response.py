@@ -1025,6 +1025,16 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
 
     def _context_updated_task_finished(self, task: asyncio.Task):
         self._context_updated_tasks.discard(task)
+        # Surface failures loudly, with traceback: same silent-failure fix as
+        # the universal aggregator — a dead on_context_updated task used to
+        # vanish without any log, hiding engine set_node crashes.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.opt(exception=(type(exc), exc, exc.__traceback__)).error(
+                f"{self} on_context_updated task failed"
+            )
 
 
 class LLMUserResponseAggregator(LLMUserContextAggregator):
