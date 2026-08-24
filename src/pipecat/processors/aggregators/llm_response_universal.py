@@ -904,6 +904,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
     def _context_updated_task_finished(self, task: asyncio.Task):
         self._context_updated_tasks.discard(task)
+        # Surface failures loudly: a dead on_context_updated task previously
+        # failed silently (exception never retrieved), which hid engine
+        # set_node crashes such as the Gemini LLMSpecificMessage TypeError.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"{self} on_context_updated task failed: {exc}")
 
 
 class LLMContextAggregatorPair:
