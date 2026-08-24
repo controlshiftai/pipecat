@@ -398,9 +398,12 @@ class LLMService(AIService):
         Args:
             function_name: The name of the function handler to remove.
         """
-        del self._functions[function_name]
-        if self._start_callbacks[function_name]:
-            del self._start_callbacks[function_name]
+        # pop() with a default: functions registered without a start callback
+        # have no _start_callbacks entry, and callers may attempt to unregister
+        # a function that was never registered (both previously raised
+        # KeyError, crashing node transitions on the real LLMService).
+        self._functions.pop(function_name, None)
+        self._start_callbacks.pop(function_name, None)
 
     def unregister_direct_function(self, handler: Any):
         """Remove a registered direct function handler.
