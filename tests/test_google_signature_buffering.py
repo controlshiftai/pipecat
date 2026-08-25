@@ -33,6 +33,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMMessagesAppendFrame,
 )
+from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.llm import GoogleLLMService
@@ -353,6 +354,155 @@ class TestSignatureDiscard(unittest.TestCase):
         survivors = h.service._pending_function_calls
         assert [fc.function_name for fc in survivors] == ["end_call"]
         assert len(h.service._pending_signature_frames) == 1
+
+
+class TestMixedBatchSignatureOwnership(unittest.TestCase):
+    """Codex P2 round 2: when a dropped cancellable call owns a signature,
+    keeping the surviving calls would commit them unsigned (Gemini 3 wants
+    the signature on the first FC part) and the next request would 400."""
+
+    def _register_end_call(self, service):
+        async def end_call_handler(params):
+            pass
+
+        service.register_function(
+            "end_call", end_call_handler, cancel_on_interruption=False
+        )
+
+    def _next_request_messages(self, h, spoken_text, surviving_fc=None):
+        """Build the universal context the next request would be built from:
+        committed user/assistant text, the surviving tool call (if any), and
+        whatever signature frames actually flushed."""
+        messages = [
+            {"role": "user", "content": "Yes, please"},
+            {"role": "assistant", "content": spoken_text},
+        ]
+        if surviving_fc is not None:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": surviving_fc.tool_call_id,
+                            "function": {
+                                "name": surviving_fc.function_name,
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+        for frame in h.signature_frames():
+            messages.extend(frame.messages)
+        return messages
+
+    def test_dropped_call_owning_signature_discards_entire_batch(self):
+        """Direct first-FC signature: send_sms (first, cancellable) owns the
+        signature; end_call survives cancellability — but it would be
+        committed unsigned, so the whole batch must be discarded."""
+        h = _Harness(
+            [
+                _chunk(
+                    Part(text="Doing both now."),
+                    Part(
+                        function_call=FunctionCall(
+                            id="fc-sms", name="send_sms", args={}
+                        ),
+                        thought_signature=b"sig-sms",
+                    ),
+                    _fc("fc-end", name="end_call"),
+                )
+            ]
+        )
+        self._register_end_call(h.service)
+        asyncio.run(h.run())
+        assert len(h.service._pending_function_calls) == 2
+        assert h.service._pending_signature_frames[0].messages[0].message[
+            "bookmark"
+        ] == {"function_call": "fc-sms"}
+
+        asyncio.run(
+            h.service.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        )
+
+        # The entire batch is discarded — including the non-cancellable
+        # survivor — because its signature belonged to the dropped call.
+        assert h.service._pending_function_calls == []
+        assert h.service._pending_signature_frames == []
+
+        asyncio.run(
+            h.service.process_frame(
+                BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM
+            )
+        )
+        assert h.run_fc_calls == 0
+        assert h.signature_frames() == []
+
+        # Round-trip: the next request's context carries no function calls
+        # and no orphan signatures, so it cannot 400.
+        adapter = GeminiLLMAdapter()
+        converted = adapter._from_universal_context_messages(
+            self._next_request_messages(h, "Doing both now.")
+        )
+        fc_parts = [
+            p
+            for m in converted.messages
+            for p in m.parts
+            if getattr(p, "function_call", None)
+        ]
+        assert fc_parts == []
+
+    def test_survivor_owning_signature_keeps_batch_and_valid_next_request(self):
+        """Signature anchored to the surviving end_call: batch is kept, and
+        the next request's context has every function-call part signed."""
+        h = _Harness(
+            [
+                _chunk(
+                    Part(text="Doing both now."),
+                    _fc("fc-sms", name="send_sms"),
+                    Part(
+                        function_call=FunctionCall(
+                            id="fc-end", name="end_call", args={}
+                        ),
+                        thought_signature=b"sig-end",
+                    ),
+                )
+            ]
+        )
+        self._register_end_call(h.service)
+        asyncio.run(h.run())
+
+        asyncio.run(
+            h.service.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        )
+
+        survivors = h.service._pending_function_calls
+        assert [fc.function_name for fc in survivors] == ["end_call"]
+        assert len(h.service._pending_signature_frames) == 1
+
+        asyncio.run(
+            h.service.process_frame(
+                BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM
+            )
+        )
+        assert h.run_fc_calls == 1
+        assert h.signature_frames() != []
+
+        # Round-trip: every function-call part in the next request's context
+        # carries its thought signature.
+        adapter = GeminiLLMAdapter()
+        converted = adapter._from_universal_context_messages(
+            self._next_request_messages(h, "Doing both now.", survivors[0])
+        )
+        fc_parts = [
+            p
+            for m in converted.messages
+            for p in m.parts
+            if getattr(p, "function_call", None)
+        ]
+        assert len(fc_parts) == 1
+        assert fc_parts[0].function_call.id == "fc-end"
+        assert fc_parts[0].thought_signature == b"sig-end"
 
 
 if __name__ == "__main__":

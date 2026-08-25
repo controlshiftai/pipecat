@@ -996,6 +996,19 @@ class GoogleLLMService(LLMService):
             return True
         return entry.cancel_on_interruption
 
+    @staticmethod
+    def _signature_frame_fc_bookmark(frame: LLMMessagesAppendFrame) -> Optional[str]:
+        """Return the function-call id a buffered signature frame anchors to,
+        or None for text/inline_data bookmarks and malformed frames."""
+        try:
+            message = frame.messages[0].message
+        except (IndexError, AttributeError, TypeError):
+            return None
+        if isinstance(message, dict):
+            bookmark = message.get("bookmark") or {}
+            return bookmark.get("function_call")
+        return None
+
     @traced_llm
     async def _process_context(self, context: OpenAILLMContext | LLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
@@ -1300,14 +1313,35 @@ class GoogleLLMService(LLMService):
                     for fc in self._pending_function_calls
                     if not self._is_cancellable_on_interruption(fc.function_name)
                 ]
-                dropped = len(self._pending_function_calls) - len(survivors)
+                dropped = [
+                    fc
+                    for fc in self._pending_function_calls
+                    if self._is_cancellable_on_interruption(fc.function_name)
+                ]
                 if dropped:
                     logger.debug(
-                        f"{self}: Dropping {dropped} deferred function call(s) on interruption"
+                        f"{self}: Dropping {len(dropped)} deferred function call(s) on interruption"
                     )
-                self._pending_function_calls = survivors
-                if not survivors:
+                # If any buffered signature is anchored to a DROPPED call, the
+                # survivors would be committed unsigned — Gemini 3 requires
+                # the signature on the (first) FC part, so the next request
+                # would 400. Safest fallback: discard the whole batch.
+                dropped_ids = {fc.tool_call_id for fc in dropped}
+                batch_poisoned = bool(dropped_ids) and any(
+                    self._signature_frame_fc_bookmark(f) in dropped_ids
+                    for f in self._pending_signature_frames
+                )
+                if batch_poisoned:
+                    logger.debug(
+                        f"{self}: Discarding entire deferred batch — a dropped "
+                        "function call owns a thought signature"
+                    )
+                    self._pending_function_calls = []
                     self._discard_signature_frames()
+                else:
+                    self._pending_function_calls = survivors
+                    if not survivors:
+                        self._discard_signature_frames()
 
         context = None
 
