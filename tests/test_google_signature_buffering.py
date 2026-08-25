@@ -28,6 +28,7 @@ from loguru import logger
 
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
+    CancelFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMMessagesAppendFrame,
@@ -223,6 +224,135 @@ class TestSignatureDiscard(unittest.TestCase):
 
         # Only the new response's signature is flushed; the stale one is gone.
         assert h.bookmarks() == [{"text": "Fresh"}]
+
+    def test_cancel_frame_clears_pending_and_closes_client(self):
+        h = self._deferred_harness()
+        h.service._close_client = AsyncMock()
+
+        asyncio.run(h.service.cancel(CancelFrame()))
+
+        assert h.service._pending_function_calls == []
+        assert h.service._pending_signature_frames == []
+        h.service._close_client.assert_awaited_once()
+
+    def test_mid_stream_interruption_poisons_response(self):
+        """A caller barging in WHILE the model is still streaming: the
+        half-generated response never commits signatures and its function
+        calls are dropped when the stream settles."""
+        service = GoogleLLMService(api_key="test-key", model="gemini-3.7-flash")
+        pushed = []
+        run_fc_calls = 0
+        first_chunk_seen = asyncio.Event()
+        resume_stream = asyncio.Event()
+
+        async def fake_stream(context):
+            async def agen():
+                yield _chunk(Part(text="Wait, "), _sig(b"early"))
+                first_chunk_seen.set()
+                await resume_stream.wait()
+                yield _chunk(_fc("fc-late"))
+                yield _chunk(_sig(b"late"))
+
+            return agen()
+
+        async def fake_push(frame, direction=FrameDirection.DOWNSTREAM):
+            pushed.append(frame)
+
+        async def fake_run_fc(function_calls):
+            nonlocal run_fc_calls
+            run_fc_calls += 1
+
+        service._stream_content_universal_context = fake_stream
+        service.push_frame = fake_push
+        service.run_function_calls = fake_run_fc
+
+        async def drive():
+            task = asyncio.create_task(service._process_context(LLMContext()))
+            await asyncio.wait_for(first_chunk_seen.wait(), timeout=1)
+            # One signature is buffered, then the caller barges in mid-stream.
+            assert len(service._pending_signature_frames) == 1
+            await service.process_frame(
+                InterruptionFrame(), FrameDirection.DOWNSTREAM
+            )
+            resume_stream.set()
+            await task
+
+        asyncio.run(drive())
+
+        assert service._pending_signature_frames == []
+        assert service._pending_function_calls == []
+        assert run_fc_calls == 0
+        assert not [f for f in pushed if isinstance(f, LLMMessagesAppendFrame)]
+        assert any(isinstance(f, LLMFullResponseEndFrame) for f in pushed)
+        assert service._in_stream is False
+        assert service._response_interrupted is True
+
+    def test_deferred_non_cancellable_transition_survives_interruption(self):
+        """Edge transitions register with cancel_on_interruption=False: an
+        interruption in the deferred window must NOT drop them (or their
+        signatures) — they still execute when TTS stops."""
+        h = _Harness(
+            [
+                _chunk(Part(text="Thanks, goodbye.")),
+                _chunk(_fc("fc-end", name="end_call")),
+                _chunk(_sig()),
+            ]
+        )
+
+        async def end_call_handler(params):
+            pass
+
+        h.service.register_function(
+            "end_call", end_call_handler, cancel_on_interruption=False
+        )
+        asyncio.run(h.run())
+
+        asyncio.run(
+            h.service.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        )
+
+        # The transition and its signature survive the interruption.
+        assert len(h.service._pending_function_calls) == 1
+        assert len(h.service._pending_signature_frames) == 1
+        assert h.run_fc_calls == 0
+
+        asyncio.run(
+            h.service.process_frame(
+                BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM
+            )
+        )
+
+        assert h.run_fc_calls == 1
+        assert h.signature_frames() != []
+
+    def test_mixed_deferred_calls_only_cancellable_dropped(self):
+        h = _Harness(
+            [
+                _chunk(Part(text="Sending it, then done.")),
+                _chunk(_fc("fc-sms", name="send_sms")),
+                _chunk(_fc("fc-end", name="end_call")),
+                _chunk(_sig()),
+            ]
+        )
+
+        async def end_call_handler(params):
+            pass
+
+        h.service.register_function(
+            "end_call", end_call_handler, cancel_on_interruption=False
+        )
+        asyncio.run(h.run())
+        assert len(h.service._pending_function_calls) == 2
+
+        asyncio.run(
+            h.service.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        )
+
+        # send_sms (default cancellable) is dropped; end_call survives, and
+        # the buffer is kept because a survivor still needs its signature.
+        survivors = h.service._pending_function_calls
+        assert [fc.function_name for fc in survivors] == ["end_call"]
+        assert len(h.service._pending_signature_frames) == 1
 
 
 if __name__ == "__main__":

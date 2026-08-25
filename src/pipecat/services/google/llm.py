@@ -787,6 +787,14 @@ class GoogleLLMService(LLMService):
         # are discarded together with the unexecuted function calls, so a
         # stale signature can never reference a call that never ran (F1).
         self._pending_signature_frames: List[LLMMessagesAppendFrame] = []
+        # Stream state: an interruption arriving while a response is still
+        # streaming poisons that response — it never commits signatures and
+        # its function calls are dropped when the stream settles. An
+        # interruption in the deferred window (response complete, tools
+        # awaiting TTS) only drops cancellable tools; non-cancellable ones
+        # (e.g. edge transitions) survive.
+        self._in_stream = False
+        self._response_interrupted = False
 
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
@@ -973,12 +981,20 @@ class GoogleLLMService(LLMService):
             )
             self._pending_signature_frames = []
 
-    async def cancel(self, frame: CancelFrame):
-        """Cancel the service, dropping uncommitted signature frames and any
-        unexecuted deferred function calls."""
-        await super().cancel(frame)
-        self._pending_function_calls = []
-        self._discard_signature_frames()
+    def _is_cancellable_on_interruption(self, function_name: Optional[str]) -> bool:
+        """Whether a pending function call should be dropped on interruption.
+
+        Mirrors _handle_interruptions: only handlers registered with
+        cancel_on_interruption=True are interrupted. Unknown names fall back
+        to the catch-all (None) registration, then to the register_function
+        default of True.
+        """
+        entry = self._functions.get(function_name)
+        if entry is None:
+            entry = self._functions.get(None)
+        if entry is None:
+            return True
+        return entry.cancel_on_interruption
 
     @traced_llm
     async def _process_context(self, context: OpenAILLMContext | LLMContext):
@@ -998,8 +1014,10 @@ class GoogleLLMService(LLMService):
         # Any signature frames left over from an aborted previous response are
         # stale — never let them leak into a new turn.
         self._discard_signature_frames()
+        self._response_interrupted = False
         accumulated_text = ""
 
+        self._in_stream = True
         try:
             # Generate content using either OpenAILLMContext or universal LLMContext
             response = await (
@@ -1119,12 +1137,13 @@ class GoogleLLMService(LLMService):
                                     ].tool_call_id
                                 else:
                                     logger.warning("Thought signature found on unhandled Part type")
-                                if bookmark:
+                                if bookmark and not self._response_interrupted:
                                     # Buffer, don't push: signature frames are
                                     # flushed only when the response commits
                                     # (function-call execution or completion)
                                     # and discarded on interruption — see
-                                    # _flush_signature_frames.
+                                    # _flush_signature_frames. An interrupted
+                                    # response never buffers further.
                                     self._pending_signature_frames.append(
                                         LLMMessagesAppendFrame(
                                             [
@@ -1186,9 +1205,16 @@ class GoogleLLMService(LLMService):
                     direction=FrameDirection.DOWNSTREAM,
                 )
 
+                if self._response_interrupted:
+                    # The response was interrupted mid-generation: a
+                    # half-formed plan must not execute tools, and its
+                    # signatures were already discarded.
+                    logger.debug(
+                        f"{self}: Dropping {len(function_calls)} function call(s) from an interrupted response"
+                    )
                 # If text was generated, defer function calls until after TTS plays
                 # Otherwise, execute them immediately
-                if text_generated_signal:
+                elif text_generated_signal:
                     self._pending_function_calls = function_calls
                     logger.debug(
                         f"{self}: Deferring {len(function_calls)} function calls until after TTS"
@@ -1213,6 +1239,7 @@ class GoogleLLMService(LLMService):
             logger.opt(exception=True).error(f"{self}: error during Gemini streaming")
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
+            self._in_stream = False
             if grounding_metadata and isinstance(grounding_metadata, dict):
                 llm_search_frame = LLMSearchResponseFrame(
                     search_result=accumulated_text,
@@ -1254,16 +1281,33 @@ class GoogleLLMService(LLMService):
             return
 
         if isinstance(frame, InterruptionFrame):
-            # The caller barged in: a deferred tool call that has not executed
-            # yet must not fire stale (e.g. send_sms after the caller changed
-            # their mind), and its buffered thought signature must never be
-            # committed to context.
-            if self._pending_function_calls:
-                logger.debug(
-                    f"{self}: Dropping {len(self._pending_function_calls)} deferred function call(s) on interruption"
-                )
-                self._pending_function_calls = []
-            self._discard_signature_frames()
+            if self._in_stream:
+                # Mid-stream: the response is half-generated. Poison it —
+                # discard buffered signatures, suppress further buffering,
+                # and drop its function calls when the stream settles. A
+                # response interrupted mid-generation never commits anything.
+                self._response_interrupted = True
+                self._discard_signature_frames()
+            else:
+                # Deferred window (response complete, tools awaiting TTS):
+                # cancellable tools must not fire stale (e.g. send_sms after
+                # the caller changed their mind). Non-cancellable ones — edge
+                # transitions are registered with cancel_on_interruption=False
+                # — survive and still execute, so their buffered signatures
+                # must be kept or the next request would 400.
+                survivors = [
+                    fc
+                    for fc in self._pending_function_calls
+                    if not self._is_cancellable_on_interruption(fc.function_name)
+                ]
+                dropped = len(self._pending_function_calls) - len(survivors)
+                if dropped:
+                    logger.debug(
+                        f"{self}: Dropping {dropped} deferred function call(s) on interruption"
+                    )
+                self._pending_function_calls = survivors
+                if not survivors:
+                    self._discard_signature_frames()
 
         context = None
 
@@ -1290,8 +1334,12 @@ class GoogleLLMService(LLMService):
         await self._close_client()
 
     async def cancel(self, frame):
-        """Override cancel to gracefully close the client."""
+        """Override cancel to gracefully close the client, also dropping
+        uncommitted signature frames and unexecuted deferred function
+        calls."""
         await super().cancel(frame)
+        self._pending_function_calls = []
+        self._discard_signature_frames()
         await self._close_client()
 
     async def _close_client(self):
