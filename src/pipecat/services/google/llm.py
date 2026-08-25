@@ -26,11 +26,13 @@ from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter, GeminiLLM
 from pipecat.frames.frames import (
     AudioRawFrame,
     BotStoppedSpeakingFrame,
+    CancelFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsFromLLMInfoFrame,
+    InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -779,6 +781,12 @@ class GoogleLLMService(LLMService):
         self._tool_config = tool_config
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
+        # Thought-signature frames are buffered while a response streams and
+        # flushed downstream only when the response commits — function-call
+        # execution or normal completion. On interruption/cancellation they
+        # are discarded together with the unexecuted function calls, so a
+        # stale signature can never reference a call that never ran (F1).
+        self._pending_signature_frames: List[LLMMessagesAppendFrame] = []
 
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
@@ -950,6 +958,28 @@ class GoogleLLMService(LLMService):
 
         return await self._stream_content(params)
 
+    async def _flush_signature_frames(self) -> None:
+        """Push buffered thought-signature frames downstream (response commit)."""
+        frames, self._pending_signature_frames = self._pending_signature_frames, []
+        for frame in frames:
+            await self.push_frame(frame)
+
+    def _discard_signature_frames(self) -> None:
+        """Drop buffered thought-signature frames (interruption/cancellation)."""
+        if self._pending_signature_frames:
+            logger.debug(
+                f"{self}: Discarding {len(self._pending_signature_frames)} "
+                "buffered thought-signature frame(s)"
+            )
+            self._pending_signature_frames = []
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the service, dropping uncommitted signature frames and any
+        unexecuted deferred function calls."""
+        await super().cancel(frame)
+        self._pending_function_calls = []
+        self._discard_signature_frames()
+
     @traced_llm
     async def _process_context(self, context: OpenAILLMContext | LLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
@@ -965,6 +995,9 @@ class GoogleLLMService(LLMService):
 
         # Reset pending function calls when processing a new context
         self._pending_function_calls = []
+        # Any signature frames left over from an aborted previous response are
+        # stale — never let them leak into a new turn.
+        self._discard_signature_frames()
         accumulated_text = ""
 
         try:
@@ -1064,15 +1097,35 @@ class GoogleLLMService(LLMService):
                                     # "gemini-3-pro-image-preview" doesn't work
                                     # today due to the missing context.)
                                     bookmark["inline_data"] = part.inline_data
-                                elif part.text is not None:
+                                elif part.text is not None and accumulated_text:
                                     # Account for Gemini 3 Pro trailing
                                     # empty-text chunk by using all the text
                                     # seen so far in this response's chunks.
                                     bookmark["text"] = accumulated_text
+                                elif part.text is not None and function_calls:
+                                    # Gemini 3 trailing empty-text signature
+                                    # chunk on a function-call-only response:
+                                    # there is no text to bookmark, and an
+                                    # empty text bookmark can never match (the
+                                    # adapter treats "" as no bookmark), which
+                                    # silently dropped the signature and caused
+                                    # a missing-thought-signature 400 on the
+                                    # next request. Anchor it to the first
+                                    # function call instead — Google expects
+                                    # the signature on the first FC part for
+                                    # parallel calls.
+                                    bookmark["function_call"] = function_calls[
+                                        0
+                                    ].tool_call_id
                                 else:
                                     logger.warning("Thought signature found on unhandled Part type")
                                 if bookmark:
-                                    await self.push_frame(
+                                    # Buffer, don't push: signature frames are
+                                    # flushed only when the response commits
+                                    # (function-call execution or completion)
+                                    # and discarded on interruption — see
+                                    # _flush_signature_frames.
+                                    self._pending_signature_frames.append(
                                         LLMMessagesAppendFrame(
                                             [
                                                 self.get_llm_adapter().create_llm_specific_message(
@@ -1140,12 +1193,24 @@ class GoogleLLMService(LLMService):
                     logger.debug(
                         f"{self}: Deferring {len(function_calls)} function calls until after TTS"
                     )
+                    # Buffered signature frames flush when the deferred calls
+                    # execute (BotStoppedSpeakingFrame), not yet.
                 else:
                     logger.debug(f"{self}: Executing {len(function_calls)} function calls")
+                    await self._flush_signature_frames()
                     await self.run_function_calls(function_calls)
+            else:
+                # No function calls: the response commits at end of stream.
+                await self._flush_signature_frames()
         except DeadlineExceeded:
+            self._discard_signature_frames()
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:
+            self._discard_signature_frames()
+            # push_error logs a one-line summary; keep the full traceback so
+            # provider API failures (400s, signature rejections) are
+            # diagnosable from pod logs.
+            logger.opt(exception=True).error(f"{self}: error during Gemini streaming")
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
             if grounding_metadata and isinstance(grounding_metadata, dict):
@@ -1182,10 +1247,23 @@ class GoogleLLMService(LLMService):
                 logger.debug(
                     f"{self}: Executing {len(self._pending_function_calls)} deferred function calls after TTS"
                 )
+                await self._flush_signature_frames()
                 await self.run_function_calls(self._pending_function_calls)
                 self._pending_function_calls = []
             await self.push_frame(frame, direction)
             return
+
+        if isinstance(frame, InterruptionFrame):
+            # The caller barged in: a deferred tool call that has not executed
+            # yet must not fire stale (e.g. send_sms after the caller changed
+            # their mind), and its buffered thought signature must never be
+            # committed to context.
+            if self._pending_function_calls:
+                logger.debug(
+                    f"{self}: Dropping {len(self._pending_function_calls)} deferred function call(s) on interruption"
+                )
+                self._pending_function_calls = []
+            self._discard_signature_frames()
 
         context = None
 
