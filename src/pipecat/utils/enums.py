@@ -12,6 +12,8 @@ class EndTaskReason(Enum):
     USER_HANGUP = "user_hangup"
     USER_QUALIFIED = "user_qualified"
     USER_DISQUALIFIED = "user_disqualified"
+    TRANSFERRED = "transferred"
+    TRANSFER_FAILED = "transfer_failed"
     SYSTEM_CANCELLED = "system_cancelled"
     SYSTEM_CONNECT_ERROR = "system_connect_error"
     UNKNOWN = "unknown"
